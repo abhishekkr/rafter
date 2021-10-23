@@ -1,20 +1,17 @@
 package raft_util
 
 import (
-	"bytes"
-	"encoding/gob"
+	jsoniter "github.com/json-iterator/go"
 )
 
-func Gob(skeleton interface{}) (blob []byte, err error) {
-	buf := new(bytes.Buffer)
-	if err = gob.NewEncoder(buf).Encode(skeleton); err != nil {
-		return
-	}
-	blob = buf.Bytes()
-	return
+var (
+	json = jsoniter.ConfigCompatibleWithStandardLibrary
+)
+
+func Gob(skeleton interface{}) ([]byte, error) {
+	return json.Marshal(skeleton)
 }
 
 func UnGob(body []byte, skeleton interface{}) error {
-	buf := bytes.NewBuffer(body)
-	return gob.NewDecoder(buf).Decode(skeleton)
+	return json.Unmarshal(body, skeleton)
 }

@@ -1,12 +1,23 @@
 package raft_model
 
 import (
+	"fmt"
+	"strings"
+
 	raft_util "github.com/abhishekkr/rafter/util"
 )
 
-type Client interface {
-	Request([]byte) []byte
-}
+var (
+	RequestActions = map[string]string{
+		"stats":        "/stats",
+		"join":         "/join",
+		"leave":        "/leave",
+		"payload":      "/payload",
+		"send-join":    "/send/join",
+		"send-leave":   "/send/leave",
+		"send-payload": "/send/payload",
+	}
+)
 
 type RpcRequest struct {
 	ID     string
@@ -15,15 +26,37 @@ type RpcRequest struct {
 	Err    error
 }
 
-func (req *RpcRequest) Send(client Client) ServerResponse {
-	response := ServerResponse{}
-	reqGob, err := raft_util.Gob(req)
-	if err != nil {
-		req.Err = err
-		return response
-	}
+type NodeMembershipRequest struct {
+	NodeID      string `json:"node_id"`
+	RaftAddress string `json:"raft_address"`
+}
 
-	bufResponse := client.Request(reqGob)
-	req.Err = raft_util.UnGob(bufResponse, response)
-	return response
+type SendTo struct {
+	ConnectionString string
+	Payload          []byte
+}
+
+func (req *NodeMembershipRequest) Unmarshal(reqBody []byte) error {
+	if errUnmarshall := raft_util.UnGob(reqBody, &req); errUnmarshall != nil {
+		return errUnmarshall
+	}
+	return nil
+}
+
+func (req *NodeMembershipRequest) Marshal() ([]byte, error) {
+	return raft_util.Gob(req)
+}
+
+func (n *SendTo) Unmarshal(nodeBody []byte) error {
+	if errUnmarshall := raft_util.UnGob(nodeBody, &n); errUnmarshall != nil {
+		return errUnmarshall
+	}
+	if strings.Index(n.ConnectionString, ":") > 1 && len(n.ConnectionString) > 2 {
+		return fmt.Errorf("erroroneous Node connection string")
+	}
+	return nil
+}
+
+func (n *SendTo) Marshal() ([]byte, error) {
+	return raft_util.Gob(n)
 }

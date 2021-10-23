@@ -1,100 +1,88 @@
 package raft_server
 
 import (
-	"encoding/json"
 	"fmt"
+	"log"
+	"net"
+	"os"
+	"path/filepath"
 
-	"github.com/abhishekkr/gol/golnet"
 	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb"
 
 	raft_cfg "github.com/abhishekkr/rafter/cfg"
-	raft_model "github.com/abhishekkr/rafter/model"
-	raft_node "github.com/abhishekkr/rafter/node"
-	raft_util "github.com/abhishekkr/rafter/util"
+	raft_controller "github.com/abhishekkr/rafter/controller"
+	raft_fsm "github.com/abhishekkr/rafter/fsm"
 )
 
-var (
-	ThisNode *raft_node.Node
-)
-
-func New() {
-	ThisNode = raft_node.New(&raft.Raft{})
-	go golnet.TCPServer(
-		fmt.Sprintf("%s:%s", raft_cfg.Address, raft_cfg.Port),
-		tcpHandler,
-	)
+type Manager struct {
+	Server *TCPServer
+	Store  raft_fsm.StoreHandle
 }
 
-func errBody(body string, err error) []byte {
-	response := raft_model.ServerResponse{
-		Body: []byte(body),
-		Err:  err,
-	}
-	blob, errGlob := raft_util.Gob(response)
-	if errGlob != nil {
-		return []byte(errGlob.Error())
-	}
-	return blob
-}
+func New() *Manager {
+	var raftBinAddr = fmt.Sprintf("%s:%s", raft_cfg.Address, raft_cfg.Port)
 
-func tcpHandler(reqBytes []byte) []byte {
-	req := raft_model.RpcRequest{}
-	if errUnmarshall := json.Unmarshal(reqBytes, &req); errUnmarshall != nil {
-		return errBody("raft:server malformed request", errUnmarshall)
-	}
-	switch req.Action {
-	case "stats":
-		return NodeStats()
-	case "join":
-		return NodeJoin()
-	case "leave":
-		return NodeLeave()
-	case "payload":
-		return Payload()
-	default:
-		errAction := fmt.Errorf("unidentified request: %v", req)
-		return errBody("raft:server unhandled action", errAction)
-	}
-}
+	raftConf := raft.DefaultConfig()
+	raftConf.LocalID = raft.ServerID(raft_cfg.ID)
+	raftConf.SnapshotThreshold = 1024
 
-func NodeStats() []byte {
-	blob, errGlob := raft_util.Gob(ThisNode.Stats())
-	if errGlob != nil {
-		return []byte(errGlob.Error())
+	fsmStore, errFSM := raft_fsm.NewFSM()
+	if errFSM != nil {
+		log.Fatal(errFSM)
+		return &Manager{}
 	}
-	return blob
-}
 
-func NodeJoin() []byte {
-	req := raft_node.NodeMembershipRequest{
-		NodeID:      raft_cfg.ID,
-		RaftAddress: raft_cfg.Address,
+	store, err := raftboltdb.NewBoltStore(filepath.Join(raft_cfg.RaftVolumeDir, "raft.dataRepo"))
+	if err != nil {
+		log.Fatal(err)
+		return &Manager{}
 	}
-	blob, errGlob := raft_util.Gob(ThisNode.JoinRequest(req))
-	if errGlob != nil {
-		return []byte(errGlob.Error())
-	}
-	return blob
-}
 
-func NodeLeave() []byte {
-	req := raft_node.NodeMembershipRequest{
-		NodeID: raft_cfg.ID,
+	// Wrap the store in a LogCache to improve performance.
+	cacheStore, err := raft.NewLogCache(raft_cfg.RaftLogCacheSize, store)
+	if err != nil {
+		log.Fatal(err)
+		return &Manager{}
 	}
-	blob, errGlob := raft_util.Gob(ThisNode.RemoveRequest(req))
-	if errGlob != nil {
-		return []byte(errGlob.Error())
-	}
-	return blob
-}
 
-func Payload() []byte {
-	req := raft_node.NodeMembershipRequest{
-		NodeID: raft_cfg.ID,
+	snapshotStore, err := raft.NewFileSnapshotStore(raft_cfg.RaftVolumeDir, raft_cfg.RaftSnapShotRetain, os.Stdout)
+	if err != nil {
+		log.Fatal(err)
+		return &Manager{}
 	}
-	blob, errGlob := raft_util.Gob(ThisNode.RemoveRequest(req))
-	if errGlob != nil {
-		return []byte(errGlob.Error())
+
+	tcpAddr, err := net.ResolveTCPAddr("tcp", raftBinAddr)
+	if err != nil {
+		log.Fatal(err)
+		return &Manager{}
 	}
-	return blob
+
+	transport, err := raft.NewTCPTransport(raftBinAddr, tcpAddr, raft_cfg.RaftMaxPool, raft_cfg.RaftTcpTimeout, os.Stdout)
+	if err != nil {
+		log.Fatal(err)
+		return &Manager{}
+	}
+
+	raftServer, err := raft.NewRaft(raftConf, fsmStore.FSM, cacheStore, store, snapshotStore, transport)
+	if err != nil {
+		log.Fatal(err)
+		return &Manager{}
+	}
+
+	// always start single server as a leader
+	configuration := raft.Configuration{
+		Servers: []raft.Server{
+			{
+				ID:      raft.ServerID(raft_cfg.ID),
+				Address: transport.LocalAddr(),
+			},
+		},
+	}
+
+	raftServer.BootstrapCluster(configuration)
+
+	thisNode := raft_controller.New(raftServer)
+	tcpServer := &TCPServer{nodeHandler: thisNode}
+	return &Manager{Server: tcpServer, Store: fsmStore.Store}
 }
